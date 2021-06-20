@@ -23,6 +23,7 @@ set(VKW_USE_INTERNAL_GLFW ON CACHE BOOL "Use Internal GLFW.")
 set(VKW_EXTERNAL_INCLUDE "" CACHE STRING "External include paths.")
 set(VKW_EXTERNAL_LIBRARY "" CACHE STRING "External libraries.")
 set(VKW_THIRD_PARTY_PATH "" CACHE STRING "Third party directory path.")
+set(VKW_USE_CUDA ON CACHE BOOL "Use CUDA for interpolation.")
 
 # Handle flag dependency
 if (NOT VKW_LINK_DYNAMIC_VK OR WIN32 OR ANDROID)
@@ -91,6 +92,7 @@ list(APPEND VKW_INCLUDE ${VKW_THIRD_PARTY_PATH}/SPIRV-Headers/include)
 set(SKIP_SPIRV_TOOLS_INSTALL ON CACHE BOOL "")
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "")
 # set(SPIRV_CHECK_CONTEXT ON CACHE BOOL "")
+set(SPIRV_WERROR OFF CACHE BOOL "")
 setup_third_party("https://github.com/KhronosGroup/SPIRV-Tools"
                   "ec1bc3e2e5678f2c72c0d3b196780a17df637d60" TRUE
                   ${VKW_THIRD_PARTY_PATH})
@@ -132,6 +134,25 @@ if (VKW_USE_INTERNAL_GLFW)
                       ${VKW_THIRD_PARTY_PATH})
     list(APPEND VKW_INCLUDE ${VKW_THIRD_PARTY_PATH}/glfw/include)
     list(APPEND VKW_LIBRARY glfw)
+endif()
+
+# CUDA
+if (VKW_USE_CUDA)
+	message(STATUS "With CUDA")
+	find_package(CUDA REQUIRED)
+	list(APPEND VKW_INCLUDE ${CUDA_INCULDE_DIRS})
+	list(APPEND VKW_LIBRARY ${CUDA_LIBRARIES})
+	list(APPEND VKW_DEFINE -DVKW_USE_CUDA=1)
+
+	if (VKW_BUILD_EXAMPLES)
+		set(VKW_EXAMPLE_CUDA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/example/cuda)
+		cuda_add_library(example_cuda STATIC
+			${VKW_EXAMPLE_CUDA_DIR}/cuda_91.h
+			${VKW_EXAMPLE_CUDA_DIR}/cuda_91.cu
+		)
+		list(APPEND VKW_INCLUDE ${VKW_EXAMPLE_CUDA_DIR})
+		list(APPEND VKW_LIBRARY example_cuda)
+	endif()
 endif()
 
 if (VKW_BUILD_EXAMPLES)
@@ -202,6 +223,7 @@ if (VKW_BUILD_EXAMPLES)
         ${CMAKE_CURRENT_SOURCE_DIR}/example/10_glsl_optim/app.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/example/11_img_buf/app.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/example/12_comp_shader_atomic_float/app.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/example/91_cuda_interop/app.cpp
     )
 
     if (ANDROID)

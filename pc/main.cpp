@@ -1,8 +1,9 @@
 #include <functional>
+#include <iostream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <vector>
-#include <iostream>
 
 #include "../example/01_rotate_box/app.h"
 #include "../example/02_load_obj/app.h"
@@ -16,6 +17,7 @@
 #include "../example/10_glsl_optim/app.h"
 #include "../example/11_img_buf/app.h"
 #include "../example/12_comp_shader_atomic_float/app.h"
+#include "../example/91_cuda_interop/app.h"
 #include "vkw/vkw.h"
 
 // -----------------------------------------------------------------------------
@@ -26,12 +28,12 @@ namespace {
 // List of application functions
 using APP_FUNC_TYPE = std::function<void(const vkw::WindowPtr& window,
                                          std::function<void()>)>;
-const std::vector<APP_FUNC_TYPE> APP_FUNCS = {
-        RunExampleApp01, RunExampleApp02, RunExampleApp03,
-        RunExampleApp04, RunExampleApp05, RunExampleApp06,
-        RunExampleApp07, RunExampleApp08, RunExampleApp09,
-        RunExampleApp10, RunExampleApp11, RunExampleApp12,
-};
+const std::map<int, APP_FUNC_TYPE> APP_FUNCS = {
+        {1, RunExampleApp01},  {2, RunExampleApp02},  {3, RunExampleApp03},
+        {4, RunExampleApp04},  {5, RunExampleApp05},  {6, RunExampleApp06},
+        {7, RunExampleApp07},  {8, RunExampleApp08},  {9, RunExampleApp09},
+        {10, RunExampleApp10}, {11, RunExampleApp11}, {12, RunExampleApp12},
+        {91, RunExampleApp91}};
 
 // Window
 static vkw::WindowPtr g_window;
@@ -73,7 +75,7 @@ std::string AsStr(const T& t) {
 // Argument
 uint32_t DecideAppID(int argc, char const* argv[]) {
     // Decide application ID
-    uint32_t app_id = 0;
+    uint32_t app_id = 1;
     if (2 <= argc) {
         std::istringstream iss;
         app_id = static_cast<uint32_t>(std::atoi(argv[1]));
@@ -95,26 +97,32 @@ int main(int argc, char const* argv[]) {
     try {
         if (app_id == 0) {
             // Run all applications
-            for (uint32_t i = 1; i < APP_FUNCS.size() + 1; i++) {
-                vkw::PrintInfo("Run application: " + AsStr(i));
-                try {
-                    // Create window
-                    InitWindow("Example App " + AsStr(i));
-                    // Run
-                    APP_FUNCS[i - 1](g_window, LimitedDrawHook);
-                } catch (const std::exception& e) {
-                    vkw::PrintInfo(e.what());
-                    // Go to next application
-                }
-            }
+			for (auto it = APP_FUNCS.begin(); it != APP_FUNCS.end(); it++) {
+				vkw::PrintInfo("Run application: " + AsStr(it->first));
+				try {
+					// Create window
+					InitWindow("Example App " + AsStr(it->first));
+					// Run
+					it->second(g_window, LimitedDrawHook);
+				}
+				catch (const std::exception& e) {
+					vkw::PrintInfo(e.what());
+					// Go to next application
+				}
+			}
             vkw::PrintErr("All applications have finished");
-        } else if (app_id <= APP_FUNCS.size()) {
-            // Run one application
-            InitWindow("Example App " + AsStr(app_id));
-            APP_FUNCS[app_id - 1](g_window, DrawHook);
-        } else {
-            vkw::PrintErr("Invalid application ID");
-        }
+		}
+		else {
+			auto it = APP_FUNCS.find(app_id);
+			if (it != APP_FUNCS.end()) {
+				// Run one application
+				InitWindow("Example App " + AsStr(app_id));
+					it->second(g_window, DrawHook);
+			}
+			else {
+				vkw::PrintErr("Invalid application ID");
+			}
+		}
     } catch (const std::exception& e) {
         vkw::PrintInfo(e.what());
         vkw::PrintInfo("Exit app");

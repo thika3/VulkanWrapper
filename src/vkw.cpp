@@ -1,3 +1,22 @@
+#if VKW_USE_CUDA
+
+#if defined(_WIN64)
+#define VK_USE_PLATFORM_WIN32_KHR
+#define NOMINMAX
+#include <windows.h>
+#undef CreateSemaphore
+#undef CreateEvent
+#include <AclAPI.h>
+#include <VersionHelpers.h>
+#include <dxgi1_2.h>
+#endif
+
+#include <cuda_runtime_api.h>
+
+#include "vkw/helper_cuda_vkw.h"
+
+#endif  // VKW_USE_CUDA
+
 #include <vkw/vkw.h>
 
 // -----------------------------------------------------------------------------
@@ -29,6 +48,24 @@ vk::DynamicLoader g_dynamic_loader;
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 #else
 #endif
+
+#if VKW_USE_CUDA
+#if defined(_WIN64)
+const vk::ExternalMemoryHandleTypeFlagBits g_kDefaultMemoryHandleType =
+        IsWindows8Point1OrGreater() ?
+                vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32 :
+                vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32Kmt;
+const vk::ExternalSemaphoreHandleTypeFlagBits g_kDefaultSemaphoreHandleType =
+        IsWindows8Point1OrGreater() ?
+                vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32 :
+                vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32Kmt;
+#else
+const vk::ExternalMemoryHandleTypeFlagBits g_kDefaultMemoryHandleType =
+        vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd;
+const vk::ExternalSemaphoreHandleTypeFlagBits g_kDefaultSemaphoreHandleType =
+        vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd;
+#endif
+#endif  // VKW_USE_CUDA
 
 namespace vkw {
 
@@ -183,6 +220,78 @@ void WindowDeleter(GLFWwindow *ptr) {
 }
 #endif
 
+#if VKW_USE_CUDA
+#if defined(_WIN64)
+class WindowsSecurityAttributes {
+protected:
+    SECURITY_ATTRIBUTES security_attributes;
+    PSECURITY_DESCRIPTOR psecurity_descriptor;
+
+public:
+    WindowsSecurityAttributes();
+    SECURITY_ATTRIBUTES *operator&();
+    ~WindowsSecurityAttributes();
+};
+
+WindowsSecurityAttributes::WindowsSecurityAttributes() {
+    psecurity_descriptor = (PSECURITY_DESCRIPTOR)calloc(
+            1, SECURITY_DESCRIPTOR_MIN_LENGTH + 2 * sizeof(void **));
+    if (!psecurity_descriptor) {
+        throw std::runtime_error(
+                "Failed to allocate memory for security descriptor");
+    }
+
+    PSID *p_psid = (PSID *)((PBYTE)psecurity_descriptor +
+                            SECURITY_DESCRIPTOR_MIN_LENGTH);
+    PACL *p_pacl = (PACL *)((PBYTE)p_psid + sizeof(PSID *));
+
+    InitializeSecurityDescriptor(psecurity_descriptor,
+                                 SECURITY_DESCRIPTOR_REVISION);
+
+    SID_IDENTIFIER_AUTHORITY sid_identifier_authority =
+            SECURITY_WORLD_SID_AUTHORITY;
+    AllocateAndInitializeSid(&sid_identifier_authority, 1, SECURITY_WORLD_RID,
+                             0, 0, 0, 0, 0, 0, 0, p_psid);
+
+    EXPLICIT_ACCESS explicit_access;
+    ZeroMemory(&explicit_access, sizeof(EXPLICIT_ACCESS));
+    explicit_access.grfAccessPermissions =
+            STANDARD_RIGHTS_ALL | SPECIFIC_RIGHTS_ALL;
+    explicit_access.grfAccessMode = SET_ACCESS;
+    explicit_access.grfInheritance = INHERIT_ONLY;
+    explicit_access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    explicit_access.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+    explicit_access.Trustee.ptstrName = (LPTSTR)*p_psid;
+
+    SetEntriesInAcl(1, &explicit_access, NULL, p_pacl);
+
+    SetSecurityDescriptorDacl(psecurity_descriptor, TRUE, *p_pacl, FALSE);
+
+    security_attributes.nLength = sizeof(security_attributes);
+    security_attributes.lpSecurityDescriptor = psecurity_descriptor;
+    security_attributes.bInheritHandle = TRUE;
+}
+
+SECURITY_ATTRIBUTES *WindowsSecurityAttributes::operator&() {
+    return &security_attributes;
+}
+
+WindowsSecurityAttributes::~WindowsSecurityAttributes() {
+    PSID *p_psid = (PSID *)((PBYTE)psecurity_descriptor +
+                            SECURITY_DESCRIPTOR_MIN_LENGTH);
+    PACL *p_pacl = (PACL *)((PBYTE)p_psid + sizeof(PSID *));
+
+    if (*p_psid) {
+        FreeSid(*p_psid);
+    }
+    if (*p_pacl) {
+        LocalFree(*p_pacl);
+    }
+    free(psecurity_descriptor);
+}
+#endif  // _WIN64
+#endif  // VKW_USE_CUDA
+
 // -----------------------------------------------------------------------------
 // --------------------------------- Instance ----------------------------------
 // -----------------------------------------------------------------------------
@@ -232,7 +341,7 @@ std::vector<char const *> GetEnabledLayers(
 }
 
 std::vector<char const *> GetEnabledExts(
-        bool debug_enable, bool surface_enable,
+        bool debug_enable, bool surface_enable, bool export_enable,
         const std::vector<char const *> &ext_names_org) {
     std::vector<char const *> ext_names = ext_names_org;
 
@@ -259,6 +368,15 @@ std::vector<char const *> GetEnabledExts(
             ext_names.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
         }
     }
+
+#ifdef VKW_USE_CUDA
+    if (export_enable) {
+        ext_names.push_back(VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME);
+        ext_names.push_back(
+                VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME);
+    }
+#endif
+
     return ext_names;
 }
 
@@ -916,7 +1034,8 @@ InstancePackPtr CreateInstance(const std::string &app_name,
                                uint32_t engine_version, bool debug_enable,
                                bool surface_enable,
                                const std::vector<char const *> &layer_names_org,
-                               const std::vector<char const *> &ext_names_org) {
+                               const std::vector<char const *> &ext_names_org,
+                               bool export_enable) {
 #if VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL == 1
     // Initialize dispatcher with `vkGetInstanceProcAddr`, to get the instance
     // independent function pointers
@@ -928,8 +1047,8 @@ InstancePackPtr CreateInstance(const std::string &app_name,
 
     // Decide Vulkan layer and extensions
     const auto &layer_names = GetEnabledLayers(debug_enable, layer_names_org);
-    const auto &ext_names =
-            GetEnabledExts(debug_enable, surface_enable, ext_names_org);
+    const auto &ext_names = GetEnabledExts(debug_enable, surface_enable,
+                                           export_enable, ext_names_org);
 
     // Create instance
     vk::ApplicationInfo app_info = {app_name.c_str(), app_version,
@@ -1105,7 +1224,8 @@ vk::UniqueDevice CreateDevice(uint32_t queue_family_idx,
                               const vk::PhysicalDevice &physical_device,
                               uint32_t n_queues, bool swapchain_support,
                               const Features2Ptr &features,
-                              const std::vector<const char *> &ext_names_org) {
+                              const std::vector<const char *> &ext_names_org,
+                              bool export_enable) {
     // Create queue create info
     std::vector<float> queue_priorites(n_queues, 0.f);
     vk::DeviceQueueCreateInfo device_queue_create_info = {
@@ -1117,6 +1237,20 @@ vk::UniqueDevice CreateDevice(uint32_t queue_family_idx,
     if (swapchain_support) {
         ext_names.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     }
+#ifdef VKW_USE_CUDA
+    if (export_enable) {
+        ext_names.push_back(VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME);
+        ext_names.push_back(VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME);
+#ifdef _WIN64
+        ext_names.push_back(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
+        ext_names.push_back(VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+#else
+        ext_names.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+        ext_names.push_back(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+#endif  // _WIN64
+    }
+#endif  // VKW_USE_CUDA
+
     const uint32_t n_ext_names = static_cast<uint32_t>(ext_names.size());
 
     // Create a logical device
@@ -1186,10 +1320,142 @@ EventPtr CreateEvent(const vk::UniqueDevice &device) {
     return EventPtr(new vk::UniqueEvent{std::move(event)});
 }
 
-SemaphorePtr CreateSemaphore(const vk::UniqueDevice &device) {
+SemaphorePtr CreateSemaphore(const vk::UniqueDevice &device,
+                             bool export_enable) {
+#if VKW_USE_CUDA
+    if (export_enable) {
+        vk::SemaphoreCreateInfo sem_create_info = {};
+        sem_create_info.sType = vk::StructureType::eSemaphoreCreateInfo;
+
+        vk::ExportSemaphoreCreateInfoKHR exsem_create_info = {};
+        exsem_create_info.sType =
+                vk::StructureType::eExportSemaphoreCreateInfoKHR;
+        exsem_create_info.pNext = NULL;
+        exsem_create_info.handleTypes = g_kDefaultSemaphoreHandleType;
+
+#if defined(_WIN64)
+        WindowsSecurityAttributes win_security_attributes;
+        vk::ExportSemaphoreWin32HandleInfoKHR exsem_handle_info = {};
+        exsem_handle_info.sType =
+                vk::StructureType::eExportSemaphoreWin32HandleInfoKHR;
+        exsem_handle_info.pNext = NULL;
+        exsem_handle_info.pAttributes = &win_security_attributes;
+        exsem_handle_info.dwAccess =
+                DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE;
+        exsem_handle_info.name = (LPCWSTR)NULL;
+
+        exsem_create_info.pNext =
+                (g_kDefaultSemaphoreHandleType &
+                 vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32) ?
+                        &exsem_handle_info :
+                        NULL;
+#endif  // _WIN64
+        sem_create_info.pNext = &exsem_create_info;
+        auto semaphore = device->createSemaphoreUnique(sem_create_info);
+        return SemaphorePtr(new vk::UniqueSemaphore{std::move(semaphore)});
+    }
+#endif  // VKW_USE_CUDA
+
     auto semaphore = device->createSemaphoreUnique({});
     return SemaphorePtr(new vk::UniqueSemaphore{std::move(semaphore)});
 }
+
+#if VKW_USE_CUDA
+void *GetSemaphoreHandle(const vk::Device &device, vk::Semaphore &semaphore,
+                         vk::ExternalSemaphoreHandleTypeFlagBits handle_type) {
+#ifdef _WIN64
+    HANDLE handle;
+
+    vk::SemaphoreGetWin32HandleInfoKHR sem_handle_info = {};
+    sem_handle_info.sType = vk::StructureType::eSemaphoreGetWin32HandleInfoKHR;
+    sem_handle_info.pNext = NULL;
+    sem_handle_info.semaphore = semaphore;
+    sem_handle_info.handleType = handle_type;
+
+    PFN_vkGetSemaphoreWin32HandleKHR fpGetSemaphoreWin32HandleKHR;
+#if VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL
+    fpGetSemaphoreWin32HandleKHR =
+            (PFN_vkGetSemaphoreWin32HandleKHR)
+                    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(
+                            device, "vkGetSemaphoreWin32HandleKHR");
+#else
+    fpGetSemaphoreWin32HandleKHR =
+            (PFN_vkGetSemaphoreWin32HandleKHR)vkGetDeviceProcAddr(
+                    device, "vkGetSemaphoreWin32HandleKHR");
+#endif
+    if (!fpGetSemaphoreWin32HandleKHR) {
+        throw std::runtime_error(
+                "Failed to retrieve vkGetMemoryWin32HandleKHR!");
+    }
+    if (fpGetSemaphoreWin32HandleKHR(
+                device, (VkSemaphoreGetWin32HandleInfoKHR *)&sem_handle_info,
+                &handle) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to retrieve handle for buffer!");
+    }
+
+    return (void *)handle;
+#else
+    int fd = -1;
+
+    vk::SemaphoreGetFdInfoKHR sem_get_info = {};
+    sem_get_info.sType = vk::StructureType::eSemaphoreGetFdInfoKHR;
+    sem_get_info.pNext = NULL;
+    sem_get_info.semaphore = semaphore;
+    sem_get_info.handleType = handleType;
+
+    PFN_vkGetSemaphoreFdKHR fpGetSemaphoreFdKHR;
+#if VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL
+    fpGetSemaphoreFdKHR =
+            (PFN_vkGetSemaphoreFdKHR)VULKAN_HPP_DEFAULT_DISPATCHER
+                    .vkGetDeviceProcAddr(device, "vkGetSemaphoreFdKHR");
+#else
+    fpGetSemaphoreFdKHR = (PFN_vkGetSemaphoreFdKHR)vkGetDeviceProcAddr(
+            device, "vkGetSemaphoreFdKHR");
+#endif
+    if (!fpGetSemaphoreFdKHR) {
+        throw std::runtime_error(
+                "Failed to retrieve vkGetMemoryWin32HandleKHR!");
+    }
+    if (fpGetSemaphoreFdKHR(device, (VkSemaphoreGetFdInfoKHR *)&sem_get_info,
+                            &fd) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to retrieve handle for buffer!");
+    }
+
+    return (void *)(uintptr_t)fd;
+#endif  // _WIN64
+}
+
+void ImportCudaExternalSemaphore(
+        const vk::UniqueDevice &device, cudaExternalSemaphore_t &cuda_sem,
+        vk::Semaphore &vk_sem,
+        vk::ExternalSemaphoreHandleTypeFlagBits handle_type) {
+    cudaExternalSemaphoreHandleDesc exsem_handle_desc = {};
+
+    if (handle_type & vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32) {
+        exsem_handle_desc.type = cudaExternalSemaphoreHandleTypeOpaqueWin32;
+    } else if (handle_type &
+               vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueWin32Kmt) {
+        exsem_handle_desc.type = cudaExternalSemaphoreHandleTypeOpaqueWin32Kmt;
+    } else if (handle_type &
+               vk::ExternalSemaphoreHandleTypeFlagBits::eOpaqueFd) {
+        exsem_handle_desc.type = cudaExternalSemaphoreHandleTypeOpaqueFd;
+    } else {
+        throw std::runtime_error("Unknown handle type requested!");
+    }
+
+#ifdef _WIN64
+    exsem_handle_desc.handle.win32.handle =
+            (HANDLE)GetSemaphoreHandle(device.get(), vk_sem, handle_type);
+#else
+    externalSemaphoreHandleDesc.handle.fd =
+            (int)(uintptr_t)getSemaphoreHandle(device.get(), vkSem, handleType);
+#endif
+
+    exsem_handle_desc.flags = 0;
+
+    checkCudaErrors(cudaImportExternalSemaphore(&cuda_sem, &exsem_handle_desc));
+}
+#endif  // VKW_USE_CUDA
 
 // -----------------------------------------------------------------------------
 // ------------------------------- Device Memory -------------------------------
@@ -1198,7 +1464,7 @@ DeviceMemoryPackPtr CreateDeviceMemoryPack(
         const vk::UniqueDevice &device,
         const vk::PhysicalDevice &physical_device,
         const vk::MemoryRequirements &mem_req,
-        const vk::MemoryPropertyFlags &mem_prop) {
+        const vk::MemoryPropertyFlags &mem_prop, bool is_exportable) {
     // Check memory requirements
     auto actual_mem_prop = physical_device.getMemoryProperties();
     uint32_t type_bits = mem_req.memoryTypeBits;
@@ -1215,9 +1481,48 @@ DeviceMemoryPackPtr CreateDeviceMemoryPack(
     if (type_idx == uint32_t(~0)) {
         throw std::runtime_error("Failed to allocate requested memory");
     }
+    vk::MemoryAllocateInfo alloc_info = {};
+    alloc_info.sType = vk::StructureType::eMemoryAllocateInfo;
+    alloc_info.allocationSize = mem_req.size;
+    alloc_info.memoryTypeIndex = type_idx;
+
+#if VKW_USE_CUDA
+    vk::ExportMemoryAllocateInfoKHR exmem_alloc_info = {};
+    exmem_alloc_info.sType = vk::StructureType::eExportMemoryAllocateInfoKHR;
+    vk::ExportMemoryWin32HandleInfoKHR exmem_handle_info = {};
+    exmem_handle_info.sType =
+            vk::StructureType::eExportMemoryWin32HandleInfoKHR;
+
+#if defined(_WIN64)
+    WindowsSecurityAttributes win_security_attributes;
+    if (is_exportable) {
+        exmem_alloc_info.handleTypes = g_kDefaultMemoryHandleType;
+        exmem_alloc_info.pNext = NULL;
+        if (g_kDefaultMemoryHandleType &
+            vk::ExternalMemoryHandleTypeFlagBitsKHR::eOpaqueWin32) {
+            exmem_handle_info.pNext = NULL;
+            exmem_handle_info.pAttributes = &win_security_attributes;
+            exmem_handle_info.dwAccess =
+                    DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE;
+            exmem_handle_info.name = (LPCWSTR)NULL;
+
+            exmem_alloc_info.pNext = &exmem_handle_info;
+        }
+
+        alloc_info.pNext = &exmem_alloc_info;
+    }
+#else
+    if (is_exportable) {
+        exmem_alloc_info.handleTypes =
+                VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        exmem_alloc_info.pNext = NULL;
+        alloc_info.pNext = &exmem_alloc_info;
+    }
+#endif  // _WIN64
+#endif  // VKW_USE_CUDA
 
     // Allocate
-    auto dev_mem = device->allocateMemoryUnique({mem_req.size, type_idx});
+    auto dev_mem = device->allocateMemoryUnique(alloc_info);
 
     // Get size
     auto dev_mem_size = mem_req.size;
@@ -1261,6 +1566,96 @@ void RecvFromDevice(const vk::UniqueDevice &device,
     device->unmapMemory(dev_mem.get());
 }
 
+#if VKW_USE_CUDA
+void *GetMemHandle(const vk::Device &device, vk::DeviceMemory dev_mem,
+                   vk::ExternalMemoryHandleTypeFlagBits handle_type) {
+#if defined(_WIN64)
+    HANDLE handle = 0;
+    vk::MemoryGetWin32HandleInfoKHR mem_handle_info = {};
+    mem_handle_info.sType = vk::StructureType::eMemoryGetWin32HandleInfoKHR;
+    mem_handle_info.pNext = NULL;
+    mem_handle_info.memory = dev_mem;
+    mem_handle_info.handleType = handle_type;
+
+    PFN_vkGetMemoryWin32HandleKHR fpGetMemoryWin32HandleKHR;
+#if VULKAN_HPP_ENABLE_DYNAMIC_LOADER_TOOL
+    fpGetMemoryWin32HandleKHR =
+            (PFN_vkGetMemoryWin32HandleKHR)VULKAN_HPP_DEFAULT_DISPATCHER
+                    .vkGetDeviceProcAddr(device, "vkGetMemoryWin32HandleKHR");
+#else
+    fpGetMemoryWin32HandleKHR =
+            (PFN_vkGetMemoryWin32HandleKHR)vkGetDeviceProcAddr(
+                    device, "vkGetMemoryWin32HandleKHR");
+#endif
+    if (!fpGetMemoryWin32HandleKHR) {
+        throw std::runtime_error(
+                "Failed to retrieve vkGetMemoryWin32HandleKHR!");
+    }
+    if (fpGetMemoryWin32HandleKHR(
+                device, (VkMemoryGetWin32HandleInfoKHR *)&mem_handle_info,
+                &handle) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to retrieve handle for buffer!");
+    }
+    return (void *)handle;
+#else
+    int fd = -1;
+    vk::MemoryGetFdInfoKHR mem_fd_info = {};
+    mem_fd_info.sType = vk::StructureType::eMemoryGetFdInfoKHR;
+    mem_fd_info.pNext = NULL;
+    mem_fd_info.memory = dev_mem;
+    mem_fd_info.handleType = handle_type;
+
+    PFN_vkGetMemoryFdKHR fpGetMemoryFdKHR;
+    fpGetMemoryFdKHR = (PFN_vkGetMemoryFdKHR)vkGetDeviceProcAddr(
+            device, "vkGetMemoryFdKHR");
+    if (!fpGetMemoryFdKHR) {
+        throw std::runtime_error("Failed to retrieve vkGetMemoryFdKHR!");
+    }
+    if (fpGetMemoryFdKHR(device, (VkMemoryGetFdInfoKHR *)&mem_fd_info, &fd) !=
+        VK_SUCCESS) {
+        throw std::runtime_error("Failed to retrieve handle for buffer!");
+    }
+    return (void *)(uintptr_t)fd;
+#endif  // _WIN64
+}
+
+void ImportCudaExternalMemory(
+        const vk::UniqueDevice &device, void **cuda_ptr,
+        cudaExternalMemory_t &cuda_mem, vk::DeviceMemory &vk_mem,
+        vk::DeviceSize size, vk::ExternalMemoryHandleTypeFlagBits handle_type) {
+    cudaExternalMemoryHandleDesc exmem_handle_desc = {};
+    if (handle_type & vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32) {
+        exmem_handle_desc.type = cudaExternalMemoryHandleTypeOpaqueWin32;
+    } else if (handle_type &
+               vk::ExternalMemoryHandleTypeFlagBits::eOpaqueWin32Kmt) {
+        exmem_handle_desc.type = cudaExternalMemoryHandleTypeOpaqueWin32Kmt;
+    } else if (handle_type & vk::ExternalMemoryHandleTypeFlagBits::eOpaqueFd) {
+        exmem_handle_desc.type = cudaExternalMemoryHandleTypeOpaqueFd;
+    } else {
+        throw std::runtime_error("Unknown handle type requested!");
+    }
+
+    exmem_handle_desc.size = size;
+#if defined(_WIN64)
+    exmem_handle_desc.handle.win32.handle =
+            (HANDLE)GetMemHandle(device.get(), vk_mem, handle_type);
+#else
+    exmem_handle_desc.handle.fd =
+            (int)(uintptr_t)GetMemHandle(device.get(), vk_mem, handle_type);
+#endif
+
+    checkCudaErrors(cudaImportExternalMemory(&cuda_mem, &exmem_handle_desc));
+
+    cudaExternalMemoryBufferDesc exmem_buf_desc = {};
+    exmem_buf_desc.offset = 0;
+    exmem_buf_desc.size = size;
+    exmem_buf_desc.flags = 0;
+
+    checkCudaErrors(cudaExternalMemoryGetMappedBuffer(cuda_ptr, cuda_mem,
+                                                      &exmem_buf_desc));
+}
+#endif  // VKW_USE_CUDA
+
 // -----------------------------------------------------------------------------
 // ----------------------------------- Buffer ----------------------------------
 // -----------------------------------------------------------------------------
@@ -1268,15 +1663,27 @@ BufferPackPtr CreateBufferPack(const vk::PhysicalDevice &physical_device,
                                const vk::UniqueDevice &device,
                                const vk::DeviceSize &size,
                                const vk::BufferUsageFlags &usage,
-                               const vk::MemoryPropertyFlags &mem_prop) {
+                               const vk::MemoryPropertyFlags &mem_prop,
+                               bool is_exportable) {
+    vk::BufferCreateInfo buf_create_info = {vk::BufferCreateFlags(), size,
+                                            usage};
+#if VKW_USE_CUDA
+    vk::ExternalMemoryBufferCreateInfoKHR exmem_buf_create_info = {};
+    buf_create_info.pNext = NULL;
+    if (is_exportable) {
+        exmem_buf_create_info.sType =
+                vk::StructureType::eExternalMemoryBufferCreateInfoKHR;
+        exmem_buf_create_info.handleTypes |= g_kDefaultMemoryHandleType;
+        buf_create_info.pNext = &exmem_buf_create_info;
+    }
+#endif
     // Create buffer
-    auto buf =
-            device->createBufferUnique({vk::BufferCreateFlags(), size, usage});
+    auto buf = device->createBufferUnique(buf_create_info);
 
     // Allocate memory
     auto mem_req = device->getBufferMemoryRequirements(*buf);
-    DeviceMemoryPackPtr dev_mem_pack =
-            CreateDeviceMemoryPack(device, physical_device, mem_req, mem_prop);
+    DeviceMemoryPackPtr dev_mem_pack = CreateDeviceMemoryPack(
+            device, physical_device, mem_req, mem_prop, is_exportable);
 
     // Bind memory
     device->bindBufferMemory(buf.get(), dev_mem_pack->dev_mem.get(), 0);
@@ -1320,8 +1727,8 @@ ImagePackPtr CreateImagePack(const vk::PhysicalDevice &physical_device,
                              const vk::MemoryPropertyFlags &mem_prop,
                              bool is_tiling,
                              const vk::ImageAspectFlags &aspects,
-                             const vk::ImageLayout &init_layout,
-                             bool is_shared) {
+                             const vk::ImageLayout &init_layout, bool is_shared,
+                             bool is_exportable) {
     // Select tiling mode
     const vk::ImageTiling tiling =
             is_tiling ? vk::ImageTiling::eOptimal : vk::ImageTiling::eLinear;
@@ -1331,17 +1738,37 @@ ImagePackPtr CreateImagePack(const vk::PhysicalDevice &physical_device,
     // Mipmap level
     miplevel_cnt = std::min(miplevel_cnt, GetMaxMipLevelCount(size));
 
+    vk::ImageCreateInfo img_create_info = {vk::ImageCreateFlags(),
+                                           vk::ImageType::e2D,
+                                           format,
+                                           vk::Extent3D(size, 1),
+                                           miplevel_cnt,
+                                           1,
+                                           vk::SampleCountFlagBits::e1,
+                                           tiling,
+                                           usage,
+                                           shared,
+                                           0,
+                                           nullptr,
+                                           init_layout};
+#if VKW_USE_CUDA
+    vk::ExternalMemoryImageCreateInfoKHR exmem_img_create_info = {};
+    img_create_info.pNext = NULL;
+    if (is_exportable) {
+        exmem_img_create_info.sType =
+                vk::StructureType::eExternalMemoryImageCreateInfoKHR;
+        exmem_img_create_info.handleTypes |= g_kDefaultMemoryHandleType;
+        img_create_info.pNext = &exmem_img_create_info;
+    }
+#endif
+
     // Create image
-    auto img = device->createImageUnique(
-            {vk::ImageCreateFlags(), vk::ImageType::e2D, format,
-             vk::Extent3D(size, 1), miplevel_cnt, 1,
-             vk::SampleCountFlagBits::e1, tiling, usage, shared, 0, nullptr,
-             init_layout});
+    auto img = device->createImageUnique(img_create_info);
 
     // Allocate memory
     auto mem_req = device->getImageMemoryRequirements(*img);
-    DeviceMemoryPackPtr dev_mem_pack =
-            CreateDeviceMemoryPack(device, physical_device, mem_req, mem_prop);
+    DeviceMemoryPackPtr dev_mem_pack = CreateDeviceMemoryPack(
+            device, physical_device, mem_req, mem_prop, is_exportable);
 
     // Bind memory
     device->bindImageMemory(img.get(), dev_mem_pack->dev_mem.get(), 0);
@@ -1634,7 +2061,7 @@ std::tuple<BufferPackPtr, ImagePackPtr> CreateBufferImagePack(
         const vk::ImageUsageFlags &img_usage,
         const vk::MemoryPropertyFlags &mem_prop, bool is_tiling,
         const vk::ImageAspectFlags &aspects, const vk::ImageLayout &init_layout,
-        bool is_shared) {
+        bool is_shared, bool is_exportable) {
     // Select tiling mode
     const vk::ImageTiling tiling =
             is_tiling ? vk::ImageTiling::eOptimal : vk::ImageTiling::eLinear;
@@ -1645,14 +2072,45 @@ std::tuple<BufferPackPtr, ImagePackPtr> CreateBufferImagePack(
     miplevel_cnt = std::min(miplevel_cnt, GetMaxMipLevelCount(img_size));
 
     // Create buffer
-    auto buf = device->createBufferUnique(
-            {vk::BufferCreateFlags(), buf_size, buf_usage});
+    vk::BufferCreateInfo buf_create_info = {vk::BufferCreateFlags(), buf_size,
+                                            buf_usage};
+#if VKW_USE_CUDA
+    vk::ExternalMemoryBufferCreateInfoKHR exmem_buf_create_info = {};
+    buf_create_info.pNext = NULL;
+    if (is_exportable) {
+        exmem_buf_create_info.sType =
+                vk::StructureType::eExternalMemoryBufferCreateInfoKHR;
+        exmem_buf_create_info.handleTypes |= g_kDefaultMemoryHandleType;
+        buf_create_info.pNext = &exmem_buf_create_info;
+    }
+#endif
+    auto buf = device->createBufferUnique(buf_create_info);
+
     // Create image
-    auto img = device->createImageUnique(
-            {vk::ImageCreateFlags(), vk::ImageType::e2D, format,
-             vk::Extent3D(img_size, 1), miplevel_cnt, 1,
-             vk::SampleCountFlagBits::e1, tiling, img_usage, shared, 0, nullptr,
-             init_layout});
+    vk::ImageCreateInfo img_create_info = {vk::ImageCreateFlags(),
+                                           vk::ImageType::e2D,
+                                           format,
+                                           vk::Extent3D(img_size, 1),
+                                           miplevel_cnt,
+                                           1,
+                                           vk::SampleCountFlagBits::e1,
+                                           tiling,
+                                           img_usage,
+                                           shared,
+                                           0,
+                                           nullptr,
+                                           init_layout};
+#if VKW_USE_CUDA
+    vk::ExternalMemoryImageCreateInfoKHR exmem_img_create_info = {};
+    img_create_info.pNext = NULL;
+    if (is_exportable) {
+        exmem_img_create_info.sType =
+                vk::StructureType::eExternalMemoryImageCreateInfoKHR;
+        exmem_img_create_info.handleTypes |= g_kDefaultMemoryHandleType;
+        img_create_info.pNext = &exmem_img_create_info;
+    }
+#endif
+    auto img = device->createImageUnique(img_create_info);
 
     // Get memory requirements
     auto buf_mem_req = device->getBufferMemoryRequirements(*buf);
@@ -1672,8 +2130,8 @@ std::tuple<BufferPackPtr, ImagePackPtr> CreateBufferImagePack(
             buf_mem_req.memoryTypeBits | img_mem_req.memoryTypeBits;
 
     // Allocate memory
-    DeviceMemoryPackPtr dev_mem_pack =
-            CreateDeviceMemoryPack(device, physical_device, mem_req, mem_prop);
+    DeviceMemoryPackPtr dev_mem_pack = CreateDeviceMemoryPack(
+            device, physical_device, mem_req, mem_prop, is_exportable);
 
     // Bind memory
     device->bindBufferMemory(buf.get(), dev_mem_pack->dev_mem.get(), 0);

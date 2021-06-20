@@ -24,6 +24,13 @@ BEGIN_VKW_SUPPRESS_WARNING
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 #endif
+// CUDA
+#if VKW_USE_CUDA
+#include <cuda_runtime_api.h>
+extern const vk::ExternalMemoryHandleTypeFlagBits g_DefaultMemoryHandleType;
+extern const vk::ExternalSemaphoreHandleTypeFlagBits
+        g_DefaultSemaphoreHandleType;
+#endif
 END_VKW_SUPPRESS_WARNING
 // -----------------------------------------------------------------------------
 // -------------------------- End third party include --------------------------
@@ -31,8 +38,8 @@ END_VKW_SUPPRESS_WARNING
 
 #include <atomic>
 #include <functional>
-#include <map>
 #include <limits>
+#include <map>
 
 namespace vkw {
 
@@ -110,7 +117,8 @@ InstancePackPtr CreateInstance(const std::string& app_name,
                                bool debug_enable = true,
                                bool surface_enable = true,
                                const std::vector<char const*>& layer_names = {},
-                               const std::vector<char const*>& ext_names = {});
+                               const std::vector<char const*>& ext_names = {},
+                               bool export_enable = false);
 
 // -----------------------------------------------------------------------------
 // ------------------------------ PhysicalDevice -------------------------------
@@ -164,7 +172,8 @@ vk::UniqueDevice CreateDevice(uint32_t queue_family_idx,
                               uint32_t n_queues = 1,
                               bool swapchain_support = true,
                               const Features2Ptr& features = nullptr,
-                              const std::vector<const char*>& ext_names = {});
+                              const std::vector<const char*>& ext_names = {},
+                              bool export_enable = false);
 
 // -----------------------------------------------------------------------------
 // ------------------------------- Asynchronous --------------------------------
@@ -183,7 +192,8 @@ using EventPtr = std::shared_ptr<vk::UniqueEvent>;
 EventPtr CreateEvent(const vk::UniqueDevice& device);
 
 using SemaphorePtr = std::shared_ptr<vk::UniqueSemaphore>;
-SemaphorePtr CreateSemaphore(const vk::UniqueDevice& device);
+SemaphorePtr CreateSemaphore(const vk::UniqueDevice& device,
+                             bool export_enable = false);
 
 // -----------------------------------------------------------------------------
 // ------------------------------- Device Memory -------------------------------
@@ -198,7 +208,7 @@ DeviceMemoryPackPtr CreateDeviceMemoryPack(
         const vk::UniqueDevice& device,
         const vk::PhysicalDevice& physical_device,
         const vk::MemoryRequirements& mem_req,
-        const vk::MemoryPropertyFlags& mem_prop);
+        const vk::MemoryPropertyFlags& mem_prop, bool is_exportable = false);
 
 void SendToDevice(const vk::UniqueDevice& device,
                   const DeviceMemoryPackPtr& dev_mem_pack, const void* data,
@@ -206,7 +216,13 @@ void SendToDevice(const vk::UniqueDevice& device,
 void RecvFromDevice(const vk::UniqueDevice& device,
                     const DeviceMemoryPackPtr& dev_mem_pack, void* data,
                     uint64_t n_bytes);
-
+#if VKW_USE_CUDA
+void ImportCudaExternalMemory(const vk::UniqueDevice& device, void** cuda_ptr,
+                              cudaExternalMemory_t& cuda_mem,
+                              vk::DeviceMemory& vk_mem, vk::DeviceSize size,
+                              vk::ExternalMemoryHandleTypeFlagBits handle_type =
+                                      g_DefaultMemoryHandleType);
+#endif
 // -----------------------------------------------------------------------------
 // ----------------------------------- Buffer ----------------------------------
 // -----------------------------------------------------------------------------
@@ -221,13 +237,14 @@ struct BufferPack {
     DeviceMemoryPackPtr dev_mem_pack;
 };
 using BufferPackPtr = std::shared_ptr<BufferPack>;
-BufferPackPtr CreateBufferPack(
-        const vk::PhysicalDevice& physical_device,
-        const vk::UniqueDevice& device, const vk::DeviceSize& size = 256,
-        const vk::BufferUsageFlags& usage =
-                vk::BufferUsageFlagBits::eVertexBuffer,
-        const vk::MemoryPropertyFlags& mem_prop =
-                vk::MemoryPropertyFlagBits::eDeviceLocal);
+BufferPackPtr CreateBufferPack(const vk::PhysicalDevice& physical_device,
+                               const vk::UniqueDevice& device,
+                               const vk::DeviceSize& size = 256,
+                               const vk::BufferUsageFlags& usage =
+                                       vk::BufferUsageFlagBits::eVertexBuffer,
+                               const vk::MemoryPropertyFlags& mem_prop =
+                                       vk::MemoryPropertyFlagBits::eDeviceLocal,
+                               bool is_exportable = false);
 
 void SendToDevice(const vk::UniqueDevice& device, const BufferPackPtr& buf_pack,
                   const void* data, uint64_t n_bytes);
@@ -278,7 +295,7 @@ ImagePackPtr CreateImagePack(
         const vk::MemoryPropertyFlags& mem_prop = {}, bool is_tiling = true,
         const vk::ImageAspectFlags& aspects = vk::ImageAspectFlagBits::eColor,
         const vk::ImageLayout& init_layout = vk::ImageLayout::eUndefined,
-        bool is_shared = false);
+        bool is_shared = false, bool is_exportable = false);
 ImagePackPtr CreateImagePack(  // ROI
         const ImageResPackPtr& img_res_pack, const vk::UniqueDevice& device,
         const vk::Format& format = vk::Format::eUndefined,
@@ -378,7 +395,7 @@ std::tuple<BufferPackPtr, ImagePackPtr> CreateBufferImagePack(
         bool is_tiling = false,
         const vk::ImageAspectFlags& aspects = vk::ImageAspectFlagBits::eColor,
         const vk::ImageLayout& init_layout = vk::ImageLayout::eUndefined,
-        bool is_shared = false);
+        bool is_shared = false, bool is_exportable = false);
 
 // -----------------------------------------------------------------------------
 // ---------------------------------- Texture ----------------------------------
